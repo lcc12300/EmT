@@ -325,10 +325,8 @@ class AsymmetryEncoder(nn.Module):
         # 用于将差分特征投影到 hidden_graph 维度
         # 输入维度 = 差分通道数 * 特征数
         self.projector = nn.Sequential(
-            nn.Linear(self.num_pairs * in_features, out_features * 2),
-            nn.ReLU(),
-            nn.Dropout(0.25),
-            nn.Linear(out_features * 2, out_features)
+            nn.Dropout(0.5), # 输入端直接 Dropout
+            nn.Linear(self.num_pairs * in_features, out_features)
         )
 
     def forward(self, x):
@@ -356,6 +354,9 @@ class EmT(nn.Module):
                  num_feature=5, hidden_graph=16, K=2, num_head=8, dim_head=16,
                  dropout=0.25, num_class=3, alpha=0.25, graph2token='Linear', encoder_type='GCN'):
         super(EmT, self).__init__()
+        print("="*50)
+        print(">>> 成功加载 EmT++ (Neuro-Guided) 改进模型！") 
+        print("="*50)
         self.graph_encoder_type = encoder_type
         self.GE1 = GraphEncoder(
             num_layers=layers_graph[0], num_node=num_chan, in_features=num_feature,
