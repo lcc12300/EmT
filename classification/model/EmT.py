@@ -9,6 +9,33 @@ from torch.nn.modules.module import Module
 import math
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# 将此代码段添加到 EmT.py 的 import 部分之后
+
+# SEED (62通道) 对称索引对 (Left_Index, Right_Index)
+SEED_PAIRS = [
+    (0, 2), (3, 4), (5, 13), (6, 12), (7, 11), (8, 10), (15, 21), (16, 20), 
+    (17, 19), (23, 31), (24, 30), (25, 29), (26, 28), (32, 40), (33, 39), 
+    (34, 38), (35, 37), (41, 49), (42, 48), (43, 47), (44, 46), (50, 57), 
+    (51, 56), (52, 55), (58, 61), (59, 60) 
+    # 中线通道如 FPZ, FZ, CZ... 被忽略
+]
+
+# FACED/THU-EP (32通道) 对称索引对
+FACED_PAIRS = [
+    (0, 1),   # Fp1-Fp2
+    (3, 4),   # F3-F4
+    (5, 6),   # F7-F8
+    (7, 8),   # FC1-FC2
+    (9, 10),  # FC5-FC6
+    (12, 13), # C3-C4
+    (14, 15), # T7-T8
+    (18, 19), # CP1-CP2
+    (20, 21), # CP5-CP6
+    (23, 24), # P3-P4
+    (25, 26), # P7-P8
+    (27, 28), # PO3-PO4
+    (30, 31)  # O1-O2
+]
 
 class GraphConvolution(Module):
     """
@@ -264,6 +291,65 @@ class TTransformer(nn.Module):
             x = ff(x) + x
         return x
 
+class ViewAttention(nn.Module):
+    def __init__(self, input_dim):
+        super(ViewAttention, self).__init__()
+        # 一个简单的 MLP 来计算每个视图的重要性分数
+        self.score_net = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, 1)
+        )
+
+    def forward(self, x):
+        # x shape: (batch, num_views, hidden_dim)
+        
+        # 1. 计算每个视图的分数
+        scores = self.score_net(x)  # (batch, num_views, 1)
+        
+        # 2. 归一化权重 (Softmax over views)
+        weights = F.softmax(scores, dim=1)
+        
+        # 3. 加权求和
+        # (batch, num_views, 1) * (batch, num_views, hidden_dim) -> sum -> (batch, hidden_dim)
+        fused = torch.sum(weights * x, dim=1)
+        
+        return fused, weights # 返回 weights 用于可视化（可选）
+
+class AsymmetryEncoder(nn.Module):
+    def __init__(self, pairs, in_features, out_features):
+        super(AsymmetryEncoder, self).__init__()
+        self.pairs = pairs
+        self.num_pairs = len(pairs)
+        
+        # 用于将差分特征投影到 hidden_graph 维度
+        # 输入维度 = 差分通道数 * 特征数
+        self.projector = nn.Sequential(
+            nn.Linear(self.num_pairs * in_features, out_features * 2),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+            nn.Linear(out_features * 2, out_features)
+        )
+
+    def forward(self, x):
+        # x shape: (batch, num_channels, num_features)
+        
+        # 1. 提取左脑和右脑特征
+        left_indices = [p[0] for p in self.pairs]
+        right_indices = [p[1] for p in self.pairs]
+        
+        x_left = x[:, left_indices, :]
+        x_right = x[:, right_indices, :]
+        
+        # 2. 计算差分特征 (Left - Right)
+        # 这代表了半球间的不对称性 (Hemispheric Asymmetry)
+        x_diff = x_left - x_right # (batch, num_pairs, num_features)
+        
+        # 3. 展平并投影
+        x_diff = x_diff.contiguous().view(x_diff.size(0), -1)
+        out = self.projector(x_diff) # (batch, hidden_graph)
+        
+        return out
 
 class EmT(nn.Module):
     def __init__(self, layers_graph=[1, 2], layers_transformer=1, num_adj=3, num_chan=62,
@@ -282,11 +368,26 @@ class EmT(nn.Module):
 
         self.adjs = nn.Parameter(torch.FloatTensor(num_adj, num_chan, num_chan), requires_grad=True)
         nn.init.xavier_uniform_(self.adjs)
-
+# ================= [改进 1：不对称分支初始化] =================
+        # 根据通道数自动选择 Pair 列表
+        if num_chan == 62:
+            pairs = SEED_PAIRS
+        elif num_chan == 32:
+            pairs = FACED_PAIRS
+        else:
+            # 如果是其他通道数，默认回退到不使用不对称分支，或者报错
+            print(f"Warning: No symmetry pairs defined for {num_chan} channels. Asymmetry branch disabled.")
+            pairs = []
+        self.use_asymmetry = len(pairs) > 0
+        if self.use_asymmetry:
+            self.asym_encoder = AsymmetryEncoder(pairs, num_feature, hidden_graph)
+        
         if graph2token in ['AvgPool', 'MaxPool']:
             hidden_graph = num_chan
         if graph2token == 'Flatten':
             hidden_graph = num_chan*hidden_graph
+
+        self.view_attention = ViewAttention(hidden_graph)
 
         self.transformer = TTransformer(
             depth=layers_transformer,
@@ -310,13 +411,28 @@ class EmT(nn.Module):
         else:
             adjs = self.get_adj()
 
-        # multi-view pyramid residual GNN block
-        x_ = x.view(x.size(0), -1)
-        x_ = self.to_GNN_out(x_)
-        x1 = self.GE1(x, adjs[0])
-        x2 = self.GE2(x, adjs[1])
-        x = torch.stack((x_, x1, x2), dim=1)
-        x = torch.mean(x, dim=1)
+# 1. 计算原始的多视图 GCN 特征
+        x_flat = x.contiguous().view(x.size(0), -1) # 改名 x_ -> x_flat 避免混淆
+        token_base = self.to_GNN_out(x_flat)        # 基础视图 (Linear projection)
+        token_g1 = self.GE1(x, adjs[0])             # GCN视图 1
+        token_g2 = self.GE2(x, adjs[1])             # GCN视图 2
+        
+        # 2. 构建视图列表
+        views = [token_base, token_g1, token_g2]
+        
+        # 3. [改进 1] 计算不对称特征视图
+        if self.use_asymmetry:
+            token_asym = self.asym_encoder(x)
+            views.append(token_asym)
+            
+        # 4. [改进 2] 动态注意力融合
+        # 堆叠所有视图: (batch*seq, num_views, hidden_graph)
+        x_stack = torch.stack(views, dim=1) 
+        
+        # 使用注意力代替 mean
+        # 原代码: x = torch.mean(x, dim=1)
+        x, attn_weights = self.view_attention(x_stack) # x shape: (batch*seq, hidden_graph)
+
         # temporal contextual transformer
         x = rearrange(x, '(b s) h -> b s h', b=b, s=s)
         x = self.transformer(x)
